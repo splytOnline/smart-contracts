@@ -5,7 +5,7 @@
     "solidity-compiler": {
       "language": "Solidity",
       "settings": {
-        "viaIR": true,
+        "viaIR": true, // This is important for the optimizer to work correctly
         "optimizer": {
           "enabled": true,
           "runs": 200
