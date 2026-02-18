@@ -1,6 +1,6 @@
 # Splyt Smart Contracts
 
-A decentralized bill splitting protocol built on Arbitrum. This repository contains the core smart contracts for creating and managing bill splits.
+A decentralized bill splitting protocol. This repository contains the core smart contracts for creating and managing bill splits.
 
 ## Contracts Overview
 
