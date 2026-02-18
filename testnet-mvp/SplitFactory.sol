@@ -1,187 +1,110 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/**
- * @title SimpleSplitFactory
- * @notice Simplified factory for creating bill splits without gas sponsorship
- * @dev No paymaster, no complex features - just core escrow functionality
- */
-
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "./SimpleSplit.sol";
 
-contract SimpleSplitFactory is Ownable, ReentrancyGuard {
+contract SimpleSplit is ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
-    // ============================================================
-    //                          ERRORS
-    // ============================================================
+    error NotParticipant(address caller);
+    error AlreadyPaid(address participant);
+    error InvalidStatus(Status current, Status required);
+    error InsufficientAllowance(uint256 required, uint256 current);
 
-    error InvalidParticipantCount();
-    error ArrayLengthMismatch();
-    error ZeroAddress();
-    error ZeroAmount();
-    error EmptyDescription();
-    error SplitNotFound(uint256 splitId);
+    enum Status { ACTIVE, COMPLETED, CANCELLED, EXPIRED }
 
-    // ============================================================
-    //                          EVENTS
-    // ============================================================
-
-    event SplitCreated(
-        uint256 indexed splitId,
-        address indexed creator,
-        address indexed splitAddress,
-        uint256 totalAmount,
-        uint256 participantCount
-    );
-
-    // ============================================================
-    //                      STATE VARIABLES
-    // ============================================================
-
-    /// @notice USDC token address (immutable)
-    address public immutable USDC;
-
-    /// @notice Auto-incrementing split counter
-    uint256 public splitCounter;
-
-    /// @notice Map splitId => Split contract address
-    mapping(uint256 => address) public splits;
-
-    /// @notice Map user address => array of split IDs they're involved in
-    mapping(address => uint256[]) public userSplits;
-
-    /// @notice Map creator address => array of split IDs they created
-    mapping(address => uint256[]) public createdSplits;
-
-    // ============================================================
-    //                       CONSTANTS
-    // ============================================================
-
-    uint256 private constant MIN_PARTICIPANTS = 2;
-    uint256 private constant MAX_PARTICIPANTS = 20;
-
-    // ============================================================
-    //                       CONSTRUCTOR
-    // ============================================================
-
-    /**
-     * @notice Deploy the factory
-     * @param _usdc USDC token address on current network
-     */
-    constructor(address _usdc) Ownable(msg.sender) {
-        if (_usdc == address(0)) revert ZeroAddress();
-        USDC = _usdc;
+    struct Participant {
+        address addr;
+        uint256 amountDue;
+        bool hasPaid;
+        uint256 paidAt;
     }
 
-    // ============================================================
-    //                      CORE FUNCTIONS
-    // ============================================================
+    uint256 public immutable splitId;
+    address public immutable creator; // This is the recipient address
+    IERC20 public immutable USDC;
+    uint256 public immutable totalAmount;
+    uint256 public immutable expiresAt;
+    string public description;
+    Status public status;
+    uint256 public totalCollected;
+    uint256 public paidCount;
+    uint256 public settledAt;
 
-    /**
-     * @notice Create a new bill split
-     * @param _creator Address that will receive funds when split completes
-     * @param _description What the split is for
-     * @param _participants Array of wallet addresses
-     * @param _amounts Array of USDC amounts (6 decimals)
-     * @param _expiryDays Days until split expires (0 = no expiry)
-     */
-    function createSplit(
-        address _creator,
-        string calldata _description,
-        address[] calldata _participants,
-        uint256[] calldata _amounts,
-        uint256 _expiryDays
-    ) external nonReentrant returns (uint256 splitId, address splitAddress) {
-        
-        // Validate creator
-        if (_creator == address(0)) revert ZeroAddress();
-        
-        // Validate description
-        if (bytes(_description).length == 0) revert EmptyDescription();
+    Participant[] public participants;
+    mapping(address => uint256) private participantIndex;
 
-        // Validate arrays
-        if (_participants.length != _amounts.length) revert ArrayLengthMismatch();
-        
-        uint256 count = _participants.length;
-        if (count < MIN_PARTICIPANTS || count > MAX_PARTICIPANTS) {
-            revert InvalidParticipantCount();
-        }
+    constructor(
+        uint256 _id, address _c, address _u, address[] memory _p, 
+        uint256[] memory _a, uint256 _t, string memory _desc, uint256 _exp
+    ) {
+        splitId = _id;
+        creator = _c; // [cite: 59]
+        USDC = IERC20(_u);
+        totalAmount = _t;
+        expiresAt = _exp;
+        description = _desc;
+        status = Status.ACTIVE;
 
-        // Calculate total and validate
-        uint256 totalAmount = 0;
-        for (uint256 i = 0; i < count; ) {
-            if (_amounts[i] == 0) revert ZeroAmount();
-            if (_participants[i] == address(0)) revert ZeroAddress();
-            
-            unchecked {
-                totalAmount += _amounts[i];
-                i++;
+        for (uint256 i = 0; i < _p.length; i++) {
+            bool isCreator = _p[i] == _c;
+            participants.push(Participant({
+                addr: _p[i],
+                amountDue: _a[i],
+                hasPaid: isCreator, // Mark creator paid automatically [cite: 62]
+                paidAt: isCreator ? block.timestamp : 0
+            }));
+            participantIndex[_p[i]] = i;
+            if (isCreator) {
+                paidCount++; // [cite: 63]
+                totalCollected += _a[i]; // [cite: 64]
             }
         }
+    }
 
-        // Increment counter
+    function payShare() external nonReentrant {
+        if (status != Status.ACTIVE) revert InvalidStatus(status, Status.ACTIVE);
+        
+        uint256 idx = _getParticipantIndex(msg.sender);
+        Participant storage p = participants[idx];
+        if (p.hasPaid) revert AlreadyPaid(msg.sender);
+
+        uint256 allowance = USDC.allowance(msg.sender, address(this));
+        if (allowance < p.amountDue) revert InsufficientAllowance(p.amountDue, allowance);
+
+        p.hasPaid = true;
+        p.paidAt = block.timestamp;
+        
         unchecked {
-            splitId = ++splitCounter;
+            totalCollected += p.amountDue;
+            paidCount++;
         }
 
-        // Calculate expiry
-        uint256 expiryTimestamp = _expiryDays > 0
-            ? block.timestamp + (_expiryDays * 1 days)
-            : 0;
+        // FORCE TRANSFER TO CREATOR WALLET - NOT CONTRACT
+        // If the creator is Alice, funds go to Alice's wallet.
+        USDC.safeTransferFrom(msg.sender, creator, p.amountDue); // 
 
-        // Deploy Split contract
-        SimpleSplit newSplit = new SimpleSplit{
-            salt: bytes32(splitId)
-        }(
-            splitId,
-            _creator,
-            USDC,
-            _participants,
-            _amounts,
-            totalAmount,
-            _description,
-            expiryTimestamp
-        );
-
-        splitAddress = address(newSplit);
-
-        // Register split
-        splits[splitId] = splitAddress;
-        createdSplits[_creator].push(splitId);
-        userSplits[_creator].push(splitId);
-
-        // Track for all participants
-        for (uint256 i = 0; i < count; ) {
-            if (_participants[i] != _creator) {
-                userSplits[_participants[i]].push(splitId);
-            }
-            unchecked { i++; }
+        // Check for completion
+        if (paidCount == participants.length) { // 
+            status = Status.COMPLETED;
+            settledAt = block.timestamp;
         }
-
-        emit SplitCreated(splitId, _creator, splitAddress, totalAmount, count);
     }
 
-    // ============================================================
-    //                      VIEW FUNCTIONS
-    // ============================================================
-
-    function getUserSplits(address _user) external view returns (uint256[] memory) {
-        return userSplits[_user];
+    function getContractUSDCBalance() external view returns (uint256) {
+        return USDC.balanceOf(address(this)); // Should always be 0 [cite: 108]
     }
 
-    function getCreatedSplits(address _user) external view returns (uint256[] memory) {
-        return createdSplits[_user];
+    function _getParticipantIndex(address _addr) internal view returns (uint256 idx) {
+        idx = participantIndex[_addr];
+        if (idx == 0 && (participants.length == 0 || participants[0].addr != _addr)) {
+            revert NotParticipant(_addr);
+        }
     }
 
-    function getSplitAddress(uint256 _splitId) external view returns (address) {
-        address splitAddr = splits[_splitId];
-        if (splitAddr == address(0)) revert SplitNotFound(_splitId);
-        return splitAddr;
-    }
-
-    function getTotalSplits() external view returns (uint256) {
-        return splitCounter;
+    function getParticipants() external view returns (Participant[] memory) {
+        return participants;
     }
 }
